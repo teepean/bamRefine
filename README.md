@@ -30,6 +30,14 @@ of data loss that is encountered when using mainstream pipelines.
 
 ## Installation
 
+### Requirements
+
+Before installing bamrefine, make sure you have samtools installed on your system. You can install it using your system's package manager:
+
+- On Ubuntu/Debian: `sudo apt-get install samtools`
+- On CentOS/RHEL: `sudo yum install samtools`
+- On macOS with Homebrew: `brew install samtools`
+
 Regardless of the installation method you choose below, we recommend installing `bamrefine` inside a Python virtual environment as opposed to installing it at the system or user level. Depending on your environment you may actually have to use this approach if you don't have the right permissions.
 
 We recommend you use the python module `venv` for this purpose, it is a part of The Python Standard Library thus should not require you to install it separately. You can read more about how the module works from [here](https://docs.python.org/3/library/venv.html).
@@ -182,8 +190,8 @@ This therefore means:
     using optional SAM fields in alignment records. e.g. `ZC:Z:2,1`  and `ZP:Z:0,5;-3` 
     would mean that the program masked n=2 5' and n=1 3' positions and they were at index 
     0,5 and -3 in the read sequence. 3' masking positions are represented with negative 
-	indices that start counting from the 3' end of the read and is compatible with python 
-	list indices.
+        indices that start counting from the 3' end of the read and is compatible with python 
+        list indices.
   * `-k, --keep-tmp`: Don't remove the temprorary run directory. It will include 
     intermediate BAM files, cached SNPs, etc. this directory is under the same
     directory with specified ouptut BAM, named as `.YYYY-MM-DD_HH-MM-SS_<out.bam>_tmp_bamrefine`

@@ -6,17 +6,15 @@ build-backend = "setuptools.build_meta"
 name = "bamrefine"
 version = "0.2.1"
 authors = [
-	{name="Etka Yapar", email="etka.yapar@gmail.com"},
+        {name="Etka Yapar", email="etka.yapar@gmail.com"},
 ]
 description = "A small program to mask positions that could result in a PMD artifact from a BAM file using a predefined SNP catalog"
 readme = "README.md"
 requires-python = ">=3.6"
-dependencies = [
-	"pysam >= 0.20.0",
-]
+dependencies = []
 classifiers = [
-	"Programming Language :: Python :: 3",
-	"License :: OSI Approved :: BSD License",
+        "Programming Language :: Python :: 3",
+        "License :: OSI Approved :: BSD License",
 ]
 
 [project.urls]

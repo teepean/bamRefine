@@ -2,9 +2,8 @@
 
 import sys
 import os
-import pysam
 import time
-from subprocess import Popen
+import subprocess as sp
 import getopt
 from bamRefine import functions as bamRefine
 import pickle
@@ -24,11 +23,11 @@ OPTIONS:
         -l, --pmd-length-threshold    <INT|INT,INT> pmd length threshold
 FLAGS:
         -S, --single-stranded         run the program in single-stranded mode
-        -t, --add-tags                add maskings stats as optional SAM fields to the alignments
-        -v, --verbose                 verbose output of progress
-        -k, --keep-tmp                don't remove the temporary directory (.YYYY-MM-DD_HH-MM-SS_<out.bam>_tmp_bamrefine)
-        -h, --help                    display this message and exit
-        --version                     display version information and exit
+        -t, --add-tags               add maskings stats as optional SAM fields to the alignments
+        -v, --verbose                verbose output of progress
+        -k, --keep-tmp               don't remove the temporary directory (.YYYY-MM-DD_HH-MM-SS_<out.bam>_tmp_bamrefine)
+        -h, --help                   display this message and exit
+        --version                    display version information and exit
 
 
     '''
@@ -54,6 +53,13 @@ def man(args=None):
     os.system(f"man {data_path}")
 
 
+def merge_bams(input_list, output_file, threads=1):
+    """Merge BAM files using samtools"""
+    cmd = ['samtools', 'merge', '--no-PG', '-c', '-p', '-f', '-@', str(threads), output_file]
+    cmd.extend([line.strip() for line in open(input_list)])
+    sp.run(cmd, check=True)
+
+
 def main(args=None):
     def parallelParse(jobL, n, lookup, env):
         activeJobs = []
@@ -68,7 +74,7 @@ def main(args=None):
 
             cmdList = ["bamrefine_proc", inName,c, lookup, snpF, str(int(addTags)), str(int(singleStranded))]
             cmd = " ".join(cmdList)
-            p = Popen([cmd], shell = True, env=env)
+            p = sp.Popen([cmd], shell = True, env=env)
             activeJobs.append(p)
             jobN.append(c)
             if verbose:
@@ -90,7 +96,7 @@ def main(args=None):
                     c = jobL.pop()
                     cmdList = ["bamrefine_proc", inName,c, lookup, snpF,str(int(addTags)), str(int(singleStranded))]
                     cmd = " ".join(cmdList)
-                    p = Popen([cmd], shell = True, env=env)
+                    p = sp.Popen([cmd], shell = True, env=env)
                     if verbose:
                         print("Started job for chr%s" % c)
                     activeJobs[i] = p
@@ -194,26 +200,25 @@ def main(args=None):
         print(msg, file=sys.stderr)
         exit(1)
 
-    if os.path.isfile(inName+".bai"):
-        print("Fetching Chromosomes")
-        chrms = bamRefine.fetchChromosomes(inName)
-        print("Done.")
-    elif os.path.isfile(inName):
-        msg = '''
-        input BAM is not currently indexed. Indexing...
-        '''
-        print(msg)
-        pysam.index("-@ " + str(thread), inName)
-        print("Done.")
-        chrms = bamRefine.fetchChromosomes(inName)
-        print("Fetching Chromosomes")
-        print("Done.")
-    else:
-        msg = '''
-    Can't find input BAM in the specified path.
-        '''
-        print(msg, file=sys.stderr)
-        exit(1)
+    # Check if BAM index exists, create if not
+    if not os.path.isfile(inName + ".bai"):
+        if os.path.isfile(inName):
+            msg = '''
+            input BAM is not currently indexed. Indexing...
+            '''
+            print(msg)
+            sp.run(['samtools', 'index', '-@', str(thread), inName], check=True)
+            print("Done.")
+        else:
+            msg = '''
+        Can't find input BAM in the specified path.
+            '''
+            print(msg, file=sys.stderr)
+            exit(1)
+
+    print("Fetching Chromosomes")
+    chrms = bamRefine.fetchChromosomes(inName)
+    print("Done.")
 
     ## Create a tmp directory
     try:
@@ -239,26 +244,22 @@ def main(args=None):
 
     print("Finished BAM filtering\n\nMerging BAM files...")
 
-
-
-    ## samtools merge commands -------------
+    ## Create list of BAMs to merge
     with open('toMerge_bamlist.txt', 'w') as f:
         for c in jobs_c:
             f.write(c+'.bam\n')
         if bypass:
             f.write('bypassed.bam\n')
 
-    toMergeF = 'toMerge_bamlist.txt'
-    ### ----------------------
-
     if bypass:
-        pysam.view("-@", str(thread), "--no-PG", "-L", "bypass.bed", "-b", "-o" "bypassed.bam", inName, catch_stdout=False) ##pysam bug
+        # Extract reads in bypass regions
+        sp.run(['samtools', 'view', '-@', str(thread), '--no-PG', '-L', 'bypass.bed', 
+                '-b', '-o', 'bypassed.bam', inName], check=True)
 
-    pysam.merge("--no-PG", "-c", "-p", "-b" , toMergeF, "-O", "BAM", "-@", str(thread), ouName)
+    # Merge BAM files
+    merge_bams('toMerge_bamlist.txt', ouName, threads=thread)
 
     print("Finished merging.")
-
-    ### -----------------------------------
 
     ## Wrapping up stats -----------------
     stats = []
@@ -273,21 +274,28 @@ def main(args=None):
 
     print(stats_msg % (stats_5, stats_3))
 
-    stats_cmd = "cat *_stats.txt > all_stats.txt ; "
-    stats_cmd += "ls *_stats.txt | grep -v all | sed 's/_stats.txt//g' > all_names.txt ; "
-    stats_cmd += "paste all_names.txt all_stats.txt | "
-    stats_cmd += "sort -n -k1 > " + ouName + "_bamrefine_stats.txt"
-
-    os.system(stats_cmd)
-
-    ### ----------------------------------
+    # Create final stats file using Python instead of shell commands
+    all_stats = []
+    for statFile in glob.glob('*_stats.txt'):
+        if statFile != 'all_stats.txt':
+            chrm = statFile.replace('_stats.txt', '')
+            with open(statFile) as f:
+                stats_line = f.readline().strip()
+                all_stats.append((chrm, stats_line))
+    
+    # Sort by chromosome name
+    all_stats.sort()
+    
+    # Write final stats file
+    with open(ouName + "_bamrefine_stats.txt", 'w') as f:
+        for chrm, stats in all_stats:
+            f.write(f"{chrm}\t{stats}\n")
 
     ## Cleaning up temp files -------------
     os.chdir('../')
 
     if not keeptmp:
         shutil.rmtree(tmpname)
-    ### ----------------------------------
 
     print("Program finished successfully.")
 

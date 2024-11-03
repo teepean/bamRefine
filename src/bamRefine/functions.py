@@ -1,9 +1,26 @@
-import pysam
 import os
 import pickle
 import sys
 import subprocess as sp
+import json
 from importlib.metadata import version
+
+from .sam_parser import SamParser, SamReader, SamWriter
+
+# Initialize SAM parser
+sam_parser = SamParser()
+
+def run_samtools(command, *args, input_data=None, capture_output=True):
+    """Helper function to run samtools commands"""
+    cmd = ['samtools'] + [command] + list(args)
+    if input_data:
+        process = sp.Popen(cmd, stdin=sp.PIPE, stdout=sp.PIPE, stderr=sp.PIPE)
+        stdout, stderr = process.communicate(input=input_data)
+    else:
+        process = sp.run(cmd, capture_output=capture_output)
+        stdout = process.stdout
+        stderr = process.stderr
+    return stdout, stderr
 
 def isDangerous(var):
     if ("C" in var) and ("G" in var):
@@ -37,11 +54,21 @@ def generateTags(snpList, sideList):
 
     return [tag1, tag2]
 
-def modifyHeader(input_header, bamrefine_version, bamrefine_command_line):
-    output_header_dict = input_header.to_dict()
-    prev_bamrefine = [x['ID'] for x in output_header_dict['PG'] if 'bamrefine' in x['ID']]
+def modifyHeader(header_text, bamrefine_version, bamrefine_command_line):
+    """Modify SAM header to add bamrefine program group"""
+    header_lines = header_text.strip().split('\n')
+    pg_entries = [line for line in header_lines if line.startswith('@PG')]
+    
+    # Find previous bamrefine entries
+    prev_bamrefine = []
+    for pg in pg_entries:
+        fields = dict(field.split(':', 1) for field in pg.split('\t')[1:])
+        if 'bamrefine' in fields.get('ID', ''):
+            prev_bamrefine.append(fields['ID'])
+    
+    # Generate new ID
     this_bamrefine = ""
-    if len(prev_bamrefine) > 0:
+    if prev_bamrefine:
         if '.' in prev_bamrefine[-1]:
             last_bamrefine = prev_bamrefine[-1]
             this_bamrefine = last_bamrefine.split(".")[-1]
@@ -50,41 +77,42 @@ def modifyHeader(input_header, bamrefine_version, bamrefine_command_line):
         else:
             this_bamrefine = ".1"
     ID = "bamrefine" + this_bamrefine
+    
+    # Add new PG line
+    new_pg = f"@PG\tID:{ID}\tPN:bamrefine\tVN:{bamrefine_version}\t"
+    if pg_entries:
+        new_pg += f"PP:{pg_entries[-1].split('\t')[1].split(':')[1]}\t"
+    new_pg += f"CL:{bamrefine_command_line}"
+    
+    # Insert new PG line before first non-header line
+    for i, line in enumerate(header_lines):
+        if not line.startswith('@'):
+            header_lines.insert(i, new_pg)
+            break
+    else:
+        header_lines.append(new_pg)
+    
+    return '\n'.join(header_lines)
 
-    output_header_dict['PG'].append({'ID': ID,
-                                     'PN': 'bamrefine',
-                                     'VN': bamrefine_version,
-                                     'PP': output_header_dict['PG'][-1]['ID'],
-                                     'CL': bamrefine_command_line})
-
-    output_header = pysam.AlignmentHeader.from_dict(output_header_dict)
-
-    return output_header
-
-def flagReads(snpLocDic, bamLine, look_l, look_r, bamRecord):
-
-    '''
-    Flag positions to be masked. Mapped read positions in <bamRecord> that
+def flagReads(snpLocDic, bamLine, look_l, look_r, read_dict):
+    """
+    Flag positions to be masked. Mapped read positions in <read_dict> that
     overlap with selected variants in the <snpLocDic> within <look_l> bases
     from the 5' end and <look_r> bases from the 3' end will be flagged for
     masking.
-    '''
-
+    """
     chrm = bamLine['ref_name']
     seq = bamLine['seq']
     snpList = [] # store positions to be masked
     sideList= [] # store mask sides of positions (5' or 3')
 
     ## make look_l = look_r if the latter not set:
-    look_r = {True: look_l, False: look_r}[look_r is None]
+    look_r = look_l if look_r is None else look_r
     look_list = [look_l, look_r]
 
-    refpos = bamRecord.get_reference_positions(full_length=True)
-    refpos = [x + 1 if x is not None else x for x in refpos] ## pysam uses 0-based indices
+    refpos = get_reference_positions(read_dict)
+    refpos = [x + 1 if x is not None else x for x in refpos] ## convert to 1-based indices
     read_len = len(seq)
-    ## Lookup range should be about the physical first N bases in the read, not the first
-    ## N reference bases. I will assume this until I finish implementing this feature.
-    ## this might change later.
 
     ## Default inspectRange:
     inspectRange = [refpos[:look_l], refpos[read_len-1:read_len-look_r-1:-1]]
@@ -115,20 +143,16 @@ def flagReads(snpLocDic, bamLine, look_l, look_r, bamRecord):
     else:
         return ('nomask', snpList, sideList)
 
-
 def detectSNPfileFormat(fName):
     if fName.endswith('.snp'):
         chrI = 1
         posI = 3
         refI, altI = (4, 5)
     elif fName.endswith('.bed'):
-        ncol_cmdList = ["head -n1", fName, "|", "wc -w"]
-        ncol_cmd = " ".join(ncol_cmdList)
-        p = sp.Popen([ncol_cmd], shell=True,
-                     stdout = sp.PIPE,
-                     stderr = sp.STDOUT)
-        ncol, _ = p.communicate()
-        ncol = int(ncol.decode('utf-8').strip())
+        # Read first line and count fields using Python
+        with open(fName) as f:
+            first_line = f.readline()
+            ncol = len(first_line.strip().split())
 
         chrI, posI, refI, altI = tuple(range(4))
 
@@ -137,42 +161,37 @@ def detectSNPfileFormat(fName):
 
     return (chrI, posI, refI, altI)
 
-
 def parseSNPs(fName, singleStranded):
-
     categorize_snps_func = isDangerous
     if singleStranded:
         categorize_snps_func = isDangerous_single
 
-    snpF = open(fName)
-    # curC = 'chr1'
-    # chrm = 'chr1'
     snps = [{}, {}]
 
     chrI, posI, refI, altI = detectSNPfileFormat(fName)
 
-    for snp in snpF:
-        snp = snp.strip().split()
-        curC = snp[chrI]
-        dangerous, side = categorize_snps_func([snp[refI], snp[altI]])
-        if not dangerous:
-            # ignoring otherwise
-            continue
-        key = curC + " " + snp[posI]
-        if side != 'both':
-            snps[int(side)][key] = [snp[x] for x in [chrI, posI, refI, altI]]
-        else:
-            snps[0][key] = [snp[x] for x in [chrI, posI, refI, altI]]
-            snps[1][key] = [snp[x] for x in [chrI, posI, refI, altI]]
+    with open(fName) as snpF:
+        for snp in snpF:
+            snp = snp.strip().split()
+            curC = snp[chrI]
+            dangerous, side = categorize_snps_func([snp[refI], snp[altI]])
+            if not dangerous:
+                # ignoring otherwise
+                continue
+            key = curC + " " + snp[posI]
+            if side != 'both':
+                snps[int(side)][key] = [snp[x] for x in [chrI, posI, refI, altI]]
+            else:
+                snps[0][key] = [snp[x] for x in [chrI, posI, refI, altI]]
+                snps[1][key] = [snp[x] for x in [chrI, posI, refI, altI]]
 
     if len(snps[1]) == 0:
         del(snps[1])
 
-    snpF.close()
     return snps
 
-def processBAM(inBAM, ouBAM, snps, contig, lookup, addTags = False):
-
+def processBAM(inBAM_path, ouBAM_path, snps, contig, lookup, addTags=False):
+    """Process BAM file to mask positions and add tags"""
     lookup = lookup.split(",")
     lookup_l = int(lookup[0])
     try:
@@ -180,51 +199,51 @@ def processBAM(inBAM, ouBAM, snps, contig, lookup, addTags = False):
     except IndexError:
         lookup_r = None
 
-    statsF = open(contig+"_stats.txt", 'w')
-    stats = [0,0]
+    stats = [0, 0]
 
-    for read in inBAM.fetch(contig):
-        bamL = read.to_dict()
-        mask, m_pos, m_side = flagReads(snps, bamL, lookup_l, lookup_r, read)
-        if mask == 'mask':
-            t = list(bamL['seq'])
-            q = list(bamL['qual'])
-            for p in m_pos:
-                # print('in read %s, position %d' % (bamL['name'], p))
-                t[p] = 'N'
-                q[p] = '!'
-            t1 = "".join(t)
-            q1 = "".join(q)
-            bamL['seq'] = t1
-            bamL['qual'] = q1
-            bamL = pysam.AlignedSegment.from_dict(bamL, inBAM.header)
-            st = [m_side.count(x) for x in [0,1]]
-            for x in range(2):
-                stats[x] += st[x]
-            if addTags:
-                bamL.tags += generateTags(m_pos, m_side)
-            ouBAM.write(bamL)
-        elif mask == 'nomask':
-            bamL = pysam.AlignedSegment.from_dict(bamL, inBAM.header)
-            ouBAM.write(bamL)
-        else:
-            continue
+    # Get header from input BAM
+    stdout, _ = run_samtools('view', '-H', inBAM_path)
+    header = stdout.decode('utf-8')
 
-    ## statsF.write("5p_total," + "3p_total"+ '\n')
-    statsF.write(str(stats[0]) +  "\t" + str(stats[1]) + '\n')
-    inBAM.close()
-    ouBAM.close()
-    statsF.close()
+    # Process reads using optimized SAM parser
+    with SamWriter(ouBAM_path, header=header) as writer:
+        for read_dict in SamReader(inBAM_path, region=contig):
+            mask, m_pos, m_side = flagReads(snps, read_dict, lookup_l, lookup_r, read_dict)
+            
+            if mask == 'mask':
+                # Modify sequence and quality scores
+                t = list(read_dict['seq'])
+                q = list(read_dict['qual'])
+                for p in m_pos:
+                    t[p] = 'N'
+                    q[p] = '!'
+                read_dict['seq'] = "".join(t)
+                read_dict['qual'] = "".join(q)
+                
+                # Update statistics
+                st = [m_side.count(x) for x in [0,1]]
+                for x in range(2):
+                    stats[x] += st[x]
+                    
+                # Add tags if requested
+                if addTags:
+                    tags = generateTags(m_pos, m_side)
+                    for tag_name, tag_value in tags:
+                        read_dict['tags'][tag_name] = ('Z', tag_value)
+                        
+                writer.write(read_dict)
+            elif mask == 'nomask':
+                writer.write(read_dict)
+
+    # Write statistics
+    with open(contig+"_stats.txt", 'w') as statsF:
+        statsF.write(str(stats[0]) + "\t" + str(stats[1]) + '\n')
 
 def distributeSNPs(fName, chrms, singleStranded):
-
     categorize_snps_func = isDangerous
     if singleStranded:
         categorize_snps_func = isDangerous_single
 
-    # curC = 'chr1'
-    # chrm = 'chr1'
-    # snps = [{}, {}]
     snps = {chrm: [{}, {}] for chrm in chrms}
 
     chrI, posI, refI, altI = detectSNPfileFormat(fName)
@@ -262,26 +281,20 @@ def handleSNPs(fName, singleStranded, contig):
     pickleName = os.path.basename(fName) + "_singleStranded_" + ss + "_contig_" + contig +".brf"
     f_exists = os.path.isfile(pickleName)
     if f_exists:
-        f = open(pickleName, 'rb')
-        snps = pickle.load(f)
-        f.close()
-    # else:
-    #     snps = parseSNPs(fName, singleStranded=singleStranded)
-    #     f = open(pickleName, 'wb')
-    #     pickle.dump(snps, f)
-    #     f.close()
-
+        with open(pickleName, 'rb') as f:
+            snps = pickle.load(f)
     return snps
-
 
 def createBypassBED(inName, chrms, snps, singleStranded):
     s_chrms = distributeSNPs(snps, chrms, singleStranded)
 
     toBypass = set(chrms).difference(s_chrms)
     toFilter = s_chrms
-    if toBypass != set():
-        bed = pysam.idxstats(inName).split("\n")
-        bed = [x.split("\t") for x in bed][:-2]
+    if toBypass:
+        # Use samtools idxstats instead of pysam
+        stdout, _ = run_samtools('idxstats', inName)
+        bed = stdout.decode('utf-8').split('\n')
+        bed = [x.split('\t') for x in bed if x]
         bed = [x[0:2] for x in bed if x[2] != '0']
         bed = [x for x in bed if x[0] in toBypass]
         bed = ["\t".join([x[0], "0", x[1]]) for x in bed]
@@ -296,13 +309,13 @@ def createBypassBED(inName, chrms, snps, singleStranded):
     return (list(toFilter), bypass)
 
 def fetchChromosomes(inName):
-    idstats = pysam.idxstats(inName).split("\n")
-    idstats = [x.split("\t") for x in idstats][:-2] ## last two contigs are meaningless
+    stdout, _ = run_samtools('idxstats', inName)
+    idstats = stdout.decode('utf-8').split('\n')
+    idstats = [x.split('\t') for x in idstats if x]
     chrms = [x[0] for x in idstats if x[2] != '0']
     return chrms
 
 def main(args=None):
-
     inName = sys.argv[1]
     contig = sys.argv[2]
     lookup = sys.argv[3]
@@ -310,19 +323,20 @@ def main(args=None):
     addTags = bool(int(sys.argv[5]))
     singleStranded = bool(int(sys.argv[6]))
 
-
     snps = handleSNPs(snps, singleStranded, contig)
-
     ouName = contig + ".bam"
 
     bamrefine_commandline = os.environ['BAMREFINE_CMDLINE']
     bamrefine_version = version("bamrefine")
 
-    inBAM = pysam.AlignmentFile(inName, 'rb')
-    output_header = modifyHeader(inBAM.header, bamrefine_version, bamrefine_commandline)
+    # Get header from input BAM
+    stdout, _ = run_samtools('view', '-H', inName)
+    header = stdout.decode('utf-8')
+    
+    # Modify header
+    header = modifyHeader(header, bamrefine_version, bamrefine_commandline)
 
-    ouBAM = pysam.AlignmentFile(ouName, 'wb', header=output_header)
-
-    processBAM(inBAM, ouBAM, snps, contig, lookup, addTags)
+    # Process BAM file
+    processBAM(inName, ouName, snps, contig, lookup, addTags)
 
     return 0
